@@ -1,8 +1,5 @@
-﻿#Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-
-
-# Define paths, settings, minimum file size for copying, and excluded file types
-$sourcePath = 'C:\unified_imaging\source'
+﻿# Define paths, settings, minimum file size for copying, and excluded file types
+$sourcePath = 'C:\Dicom-Files'
 $destinationPath = 'C:\unified_imaging\inbox'
 $trackingFilePath = "C:\unified_imaging\logs\copiedFiles.txt"
 $logPath = "C:\unified_imaging\logs\CopyFilesLog.txt"
@@ -10,7 +7,6 @@ $batchSize = 1000
 $waitTimeInSeconds = 5
 $minFileSizeKB = 100 # Minimum file size to copy, in kilobytes (KB)
 $excludedFileTypes = @('.exe', '.tmp', '.log', '.txt') # Extensions to exclude
-$excludedDirectories = @() # Directories to exclude, set to empty to exclude none
 
 # Function to ensure hashtable from file content
 function Get-HashtableFromFile {
@@ -18,8 +14,8 @@ function Get-HashtableFromFile {
     $hashTable = @{}
     if (Test-Path $FilePath) {
         Get-Content $FilePath | ForEach-Object {
-            $parts = $_ -split '=', 2
-            $hashTable[$parts[0].ToLower()] = $parts[1]
+            $parts = $_ -split '='
+            $hashTable[$parts[0]] = $parts[1]
         }
     }
     return $hashTable
@@ -48,12 +44,6 @@ function Is-InboxEmpty {
     }
 }
 
-function Get-UniqueKey {
-    param([string]$FilePath)
-    $relativePath = $FilePath.Substring($sourcePath.Length).Replace('\', '/').TrimStart('/')
-    return $relativePath.ToLower() # Ensure unique key is case-insensitive
-}
-
 Log-Message "Script started."
 
 $fileWatcher = New-Object System.IO.FileSystemWatcher
@@ -63,57 +53,61 @@ $fileWatcher.EnableRaisingEvents = $true
 
 Register-ObjectEvent -InputObject $fileWatcher -EventName Created -Action {
     param($source, $eventArgs)
-    $filePath = Join-Path $sourcePath $eventArgs.FullPath.Substring($sourcePath.Length).TrimStart('\')
-    $uniqueKey = Get-UniqueKey $filePath
-
-    if (-not $global:alreadyCopied.ContainsKey($uniqueKey) -and (Is-InboxEmpty -Path $destinationPath)) {
-        $fileName = $eventArgs.Name
-        Robocopy (Split-Path $filePath) $destinationPath $fileName /NP /R:2 /W:2 | Out-Null
+    $name = $eventArgs.Name
+    if (-not $global:alreadyCopied.ContainsKey($name) -and (Is-InboxEmpty -Path $destinationPath)) {
+        Robocopy $sourcePath $destinationPath $name /NP /R:2 /W:2 | Out-Null
         if ($LASTEXITCODE -le 1) {
-            $global:alreadyCopied[$uniqueKey] = $true
-            "$uniqueKey=$true" | Out-File $trackingFilePath -Append
-            Log-Message "Dynamically copied $fileName from $uniqueKey"
+            $global:alreadyCopied[$name] = $true
+            "$name=$true" | Out-File $trackingFilePath -Append
+            Log-Message "Dynamically copied $name"
         }
     }
 }
 
 do {
-    if (Is-InboxEmpty -Path $destinationPath) {
-        $fileInfos = Get-ChildItem -Path $sourcePath -File -Recurse | Where-Object {
-            $exclude = $false
-            foreach ($excludedDir in $excludedDirectories) {
-                if ($_.FullName -like "*\$excludedDir*") {
-                    $exclude = $true
-                    break
-                }
-            }
-            -not $exclude
-        } | Where-Object {
-            $fileSizeKB = $_.Length / 1KB
-            $fileExt = $_.Extension.ToLower()
-            $uniqueKey = Get-UniqueKey $_.FullName
-            -not $alreadyCopied.ContainsKey($uniqueKey) -and
-            $fileSizeKB -ge $minFileSizeKB -and
-            -not $excludedFileTypes.Contains($fileExt)
-        }
-
-        $fileInfos | Select-Object -First $batchSize | ForEach-Object {
-            $uniqueKey = Get-UniqueKey $_.FullName
-            Robocopy $_.DirectoryName $destinationPath $_.Name /NP /R:2 /W:2 | Out-Null
-            if ($LASTEXITCODE -le 1) {
-                $alreadyCopied[$uniqueKey] = $true
-                "$uniqueKey=$true" | Out-File $trackingFilePath -Append
-                Log-Message "Successfully copied $($_.Name) from $uniqueKey"
-            }
-        }
-
-        if ($fileInfos.Count -eq 0) {
-            Log-Message "No new files to copy. Waiting for new files..."
-            Start-Sleep -Seconds $waitTimeInSeconds
-        }
-    } else {
-        Log-Message "Inbox contains files. Waiting..."
+    $fileList = Get-ChildItem -Path $sourcePath -File -Recurse
+    
+    if ($fileList.Count -eq 0) {
+        Log-Message "No new files to copy. Waiting for new files..."
         Start-Sleep -Seconds $waitTimeInSeconds
     }
-} while ($true)
 
+    foreach ($file in $fileList) {
+        while ((Get-ChildItem -Path $destinationPath -File).Count -ge $batchSize) {
+            Log-Message "Destination has reached or exceeded batch size limit. Waiting..."
+            Start-Sleep -Seconds $waitTimeInSeconds
+        }
+
+        $fullPath = $file.FullName
+        $relativePath = $fullPath.Substring($sourcePath.Length).TrimStart('\')
+        $directory = $file.DirectoryName
+        $fileSizeKB = $file.Length / 1KB
+        $fileExt = $file.Extension.ToLower()
+        $name = $file.Name
+        
+        Log-Message "Processing file: $relativePath"
+
+        if ($excludedFileTypes.Contains($fileExt)) {
+            Log-Message "Skipping $relativePath - file is included file type list"
+            continue
+        }
+        
+        if ($fileSizeKB -le $minFileSizeKB) {
+            Log-Message "Skipping $relativePath - filesize is smaller than allowed"
+            continue
+        }
+        
+        if ($alreadyCopied.ContainsKey($relativePath)) {
+            Log-Message "Skipping $relativePath - it has already been copied"
+            continue
+        }
+
+        Robocopy $directory $destinationPath $fileName /NP /R:2 /W:2 | Out-Null
+
+        if ($LASTEXITCODE -le 3) {
+            $alreadyCopied[$relativePath] = $true
+            "$relativePath=$true" | Out-File $trackingFilePath -Append
+            Log-Message "Successfully copied $fileName from $relativePath"
+        }
+    }
+} while ($true)
